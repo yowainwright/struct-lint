@@ -48,6 +48,7 @@ target_sources(tree_sitter_typescript PRIVATE
   "${tree_sitter_typescript_source_SOURCE_DIR}/tsx/src/scanner.c"
 )
 add_language_grammar(javascript tree-sitter/tree-sitter-javascript 44c892e0be055ac465d5eeddae6d3e194424e7de src)
+add_language_grammar(c tree-sitter/tree-sitter-c b780e47fc780ddc8da13afa35a3f4ed5c157823d src)
 add_language_grammar(go tree-sitter/tree-sitter-go 1547678a9da59885853f5f5cc8a99cc203fa2e2c src)
 add_language_grammar(python tree-sitter/tree-sitter-python 293fdc02038ee2bf0e2e206711b69c90ac0d413f src)
 add_language_grammar(bash tree-sitter/tree-sitter-bash a06c2e4415e9bc0346c6b86d401879ffb44058f7 src)
@@ -61,6 +62,7 @@ add_library(struct_lint STATIC
   src/files.c
   src/language.c
   src/languages/typescript.c
+  src/languages/c.c
   src/languages/embedded.c
   src/languages/go.c
   src/languages/python.c
@@ -69,7 +71,7 @@ add_library(struct_lint STATIC
 target_include_directories(struct_lint PUBLIC include PRIVATE src)
 target_link_libraries(struct_lint PRIVATE
   tree-sitter tree_sitter_typescript tree_sitter_javascript
-  tree_sitter_go tree_sitter_python tree_sitter_bash Threads::Threads
+  tree_sitter_c tree_sitter_go tree_sitter_python tree_sitter_bash Threads::Threads
   tree_sitter_vue tree_sitter_svelte tree_sitter_astro tree_sitter_mdx
 )
 target_compile_definitions(struct_lint PRIVATE _POSIX_C_SOURCE=200809L)

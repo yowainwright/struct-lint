@@ -10,6 +10,13 @@ typedef struct {
 } Fixture;
 
 static const Fixture fixtures[] = {
+    {"c/clean.c", NULL, 1},
+    {"c/function-order.c", "function-order", 1},
+    {"c/export-order.c", "function-order", 0},
+    {"c/section-order.c", "section-order", 0},
+    {"c/parse-error.c", "parse-error", 0},
+    {"c/conditional-branches.c", "function-order", 2},
+    {"c/declarations.h", NULL, 0},
     {"go/clean.go", NULL, 1},
     {"go/function-order.go", "function-order", 1},
     {"go/section-order.go", "section-order", 0},
@@ -84,7 +91,7 @@ static int check_fixture(const Fixture *fixture) {
 }
 
 static int check_mixed_scan(size_t diagnostics, size_t calls) {
-  const char *const paths[] = {"go", "python", "bash", "go/clean.go", "python"};
+  const char *const paths[] = {"c", "go", "python", "bash", "go/clean.go", "python"};
   const SlRequest request = {paths, sizeof(paths) / sizeof(*paths), 1, 1};
   SlReport report = {0};
   const SlStatus status = sl_analyze(&request, &report);
