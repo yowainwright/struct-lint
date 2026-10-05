@@ -979,8 +979,9 @@ static size_t function_index(const ComponentSearch *search, const FunctionFact *
 
 static int call_target_matches(const ComponentSearch *search, const FunctionFact *caller,
                                size_t call, const FunctionFact *target) {
-  return strcmp(caller->calls[call], target->name) == 0 &&
-         nodes_coexist(search->pack, caller->call_nodes[call], target->node);
+  const int same_name = strcmp(caller->calls[call], target->name) == 0;
+  if (!same_name || search->pack->nodes_coexist == NULL) return same_name;
+  return search->pack->nodes_coexist(caller->call_nodes[call], target->node);
 }
 
 static void lower_lowlink(ComponentSearch *search, size_t current, size_t candidate) {
@@ -1620,7 +1621,8 @@ static void call_fact_free(SlCallFact *call) {
 }
 
 static void project_name_index_insert(ProjectNameIndex *index, const SlFileFact *file,
-                                      const SlDeclarationFact *declaration, const char *name) {
+                                      const SlDeclarationFact *declaration, const char *name,
+                                      int mark_ambiguous) {
   size_t slot = hash_path_name(file->resolved_path, name) & (index->capacity - 1);
   while (index->slots[slot].name != NULL &&
          (strcmp(index->slots[slot].name, name) != 0 ||
@@ -1628,24 +1630,26 @@ static void project_name_index_insert(ProjectNameIndex *index, const SlFileFact 
           strcmp(index->slots[slot].file->resolved_path, file->resolved_path) != 0))
     slot = (slot + 1) & (index->capacity - 1);
   if (index->slots[slot].name != NULL) {
-    index->slots[slot].ambiguous = 1;
+    if (mark_ambiguous) index->slots[slot].ambiguous = 1;
     return;
   }
   index->slots[slot] = (ProjectNameSlot){name, file, declaration, 0};
 }
 
 static void project_index_local_file(ProjectNameIndex *index, const SlFileFact *file) {
+  const SlLanguagePack *pack = sl_language_for_path(file->path);
+  const int mark_ambiguous = pack == NULL || pack->nodes_coexist == NULL;
   for (size_t item = 0; item < file->declaration_count; item++) {
     const SlDeclarationFact *declaration = &file->declarations[item];
     if (strcmp(declaration->kind, "function") == 0)
-      project_name_index_insert(index, file, declaration, declaration->name);
+      project_name_index_insert(index, file, declaration, declaration->name, mark_ambiguous);
   }
 }
 
 static void project_index_export_declaration(ProjectNameIndex *index, const SlFileFact *file,
                                              const SlDeclarationFact *declaration) {
   for (size_t name = 0; name < declaration->export_name_count; name++) {
-    project_name_index_insert(index, file, declaration, declaration->export_names[name]);
+    project_name_index_insert(index, file, declaration, declaration->export_names[name], 1);
   }
 }
 
