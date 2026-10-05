@@ -26,6 +26,7 @@ typedef struct {
   TSNode *call_nodes;
   size_t call_count;
   char **bindings;
+  TSNode *binding_nodes;
   size_t binding_count;
   int exported;
   int entrypoint;
@@ -68,6 +69,7 @@ typedef struct {
 typedef struct {
   const ProjectIndex *index;
   const SlFileFact *file;
+  size_t target_line;
 } ProjectLookup;
 
 typedef struct {
@@ -478,19 +480,54 @@ static SlStatus append_call(FunctionFact *function, char *name, TSNode node) {
   return SL_OK;
 }
 
-static SlStatus append_binding(FunctionFact *function, char *name) {
+static SlStatus append_binding(FunctionFact *function, char *name, TSNode node) {
   if (name == NULL) return SL_OUT_OF_MEMORY;
   const size_t size = (function->binding_count + 1) * sizeof(*function->bindings);
   char **bindings = realloc(function->bindings, size);
   if (bindings == NULL) return free(name), SL_OUT_OF_MEMORY;
   function->bindings = bindings;
-  function->bindings[function->binding_count++] = name;
+  function->bindings[function->binding_count] = name;
+  if (ts_node_is_null(node)) {
+    function->binding_count++;
+    return SL_OK;
+  }
+  TSNode *nodes = realloc(function->binding_nodes, (function->binding_count + 1) * sizeof(*nodes));
+  if (nodes == NULL) return free(name), SL_OUT_OF_MEMORY;
+  function->binding_nodes = nodes;
+  function->binding_nodes[function->binding_count++] = node;
   return SL_OK;
 }
 
-static int function_has_binding(const FunctionFact *function, const Source *source, TSNode name) {
+static TSNode lexical_scope(TSNode node) {
+  for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+       parent = ts_node_parent(parent))
+    if (node_is(parent, "compound_statement") || node_is(parent, "for_statement") ||
+        node_is(parent, "function_definition"))
+      return parent;
+  return (TSNode){0};
+}
+
+static int scope_contains(TSNode scope, TSNode node) {
+  for (TSNode parent = node; !ts_node_is_null(parent); parent = ts_node_parent(parent))
+    if (ts_node_eq(parent, scope)) return 1;
+  return 0;
+}
+
+static int binding_visible_at_call(TSNode binding, TSNode call) {
+  if (ts_node_start_byte(binding) >= ts_node_start_byte(call)) return 0;
+  const TSNode binding_scope = lexical_scope(binding);
+  const TSNode call_scope = lexical_scope(call);
+  return !ts_node_is_null(binding_scope) && !ts_node_is_null(call_scope) &&
+         scope_contains(binding_scope, call_scope);
+}
+
+static int function_has_binding(const FunctionFact *function, const Source *source, TSNode name,
+                                TSNode call) {
   for (size_t index = 0; index < function->binding_count; index++) {
-    if (node_text_equals(source, name, function->bindings[index])) return 1;
+    if (!node_text_equals(source, name, function->bindings[index])) continue;
+    const TSNode binding =
+        function->binding_nodes == NULL ? (TSNode){0} : function->binding_nodes[index];
+    if (ts_node_is_null(binding) || binding_visible_at_call(binding, call)) return 1;
   }
   return 0;
 }
@@ -499,7 +536,8 @@ static SlStatus collect_bindings(TSNode node, const Source *source, const SlLang
                                  FunctionFact *function, int is_root) {
   const TSNode binding = is_root ? (TSNode){0} : pack->binding_name_node(node);
   if (!ts_node_is_null(binding)) {
-    const SlStatus status = append_binding(function, node_text(source, binding));
+    const TSNode context = pack->nodes_coexist == NULL ? (TSNode){0} : binding;
+    const SlStatus status = append_binding(function, node_text(source, binding), context);
     if (status != SL_OK) return status;
   }
   if (!is_root && pack->is_function_node(node)) return SL_OK;
@@ -517,7 +555,7 @@ static SlStatus collect_calls(TSNode node, const Source *source, const SlLanguag
   if (!is_root && pack->is_function_node(node)) return SL_OK;
   const TSNode called_name = pack->called_name_node(node);
   const int is_shadowed =
-      !ts_node_is_null(called_name) && function_has_binding(function, source, called_name);
+      !ts_node_is_null(called_name) && function_has_binding(function, source, called_name, node);
   if (!ts_node_is_null(called_name) && !is_shadowed) {
     char *name = pack->call_name == NULL ? node_text(source, called_name)
                                          : pack->call_name(node, source->bytes);
@@ -564,6 +602,7 @@ static void declaration_fact_free(SlDeclarationFact *fact) {
   for (size_t index = 0; index < fact->call_count; index++)
     free(fact->calls[index]);
   free(fact->calls);
+  free(fact->call_target_lines);
   for (size_t index = 0; index < fact->suppression_count; index++)
     free(fact->suppressions[index]);
   free(fact->suppressions);
@@ -664,17 +703,59 @@ static SlStatus collect_imports(const char *path, TSNode declaration, const Sour
   return SL_OK;
 }
 
+typedef struct {
+  const Source *source;
+  const SlLanguagePack *pack;
+  const FunctionFact *caller;
+  size_t *target_lines;
+} CallTargetCollection;
+
+static SlStatus collect_call_target(TSNode node, void *context) {
+  CallTargetCollection *collection = context;
+  if (!collection->pack->is_function_node(node)) return SL_OK;
+  const TSNode name = collection->pack->name_node(node);
+  for (size_t index = 0; index < collection->caller->call_count; index++) {
+    const int same_name =
+        node_text_equals(collection->source, name, collection->caller->calls[index]);
+    if (collection->target_lines[index] == SIZE_MAX || !same_name) continue;
+    if (!nodes_coexist(collection->pack, collection->caller->call_nodes[index], node)) continue;
+    if (collection->target_lines[index] != 0) {
+      collection->target_lines[index] = SIZE_MAX;
+      continue;
+    }
+    collection->target_lines[index] = ts_node_start_point(node).row + 1;
+  }
+  return SL_OK;
+}
+
+static SlStatus collect_call_target_lines(TSNode root, const Source *source,
+                                          const SlLanguagePack *pack, const FunctionFact *caller,
+                                          size_t *target_lines) {
+  CallTargetCollection collection = {source, pack, caller, target_lines};
+  const SlStatus status = visit_top_level(root, pack, collect_call_target, &collection);
+  if (status != SL_OK) return status;
+  for (size_t index = 0; index < caller->call_count; index++)
+    if (target_lines[index] == SIZE_MAX) target_lines[index] = 0;
+  return SL_OK;
+}
+
 static SlStatus collect_fact_calls(TSNode node, const Source *source, const SlLanguagePack *pack,
-                                   SlDeclarationFact *fact) {
+                                   TSNode root, SlDeclarationFact *fact) {
   if (strcmp(fact->kind, "function") != 0) return SL_OK;
   FunctionFact function = {0};
-  const SlStatus status = collect_function_body(node, source, pack, &function);
+  SlStatus status = collect_function_body(node, source, pack, &function);
   fact->calls = function.calls;
   fact->call_count = function.call_count;
+  if (status == SL_OK && pack->nodes_coexist != NULL && function.call_count > 0) {
+    fact->call_target_lines = calloc(function.call_count, sizeof(*fact->call_target_lines));
+    if (fact->call_target_lines == NULL) status = SL_OUT_OF_MEMORY;
+    else status = collect_call_target_lines(root, source, pack, &function, fact->call_target_lines);
+  }
   free(function.call_nodes);
   for (size_t index = 0; index < function.binding_count; index++)
     free(function.bindings[index]);
   free(function.bindings);
+  free(function.binding_nodes);
   return status;
 }
 
@@ -706,7 +787,15 @@ static SlDeclarationFact create_declaration_fact(SlDeclarationKind kind, char *n
                              .column = point.column + 1};
 }
 
-static SlStatus collect_declaration_exports(const ExportTable *exports, SlDeclarationFact *fact) {
+static SlStatus collect_declaration_exports(TSNode input, const ExportTable *exports,
+                                            const Source *source, const SlLanguagePack *pack,
+                                            SlDeclarationFact *fact) {
+  if (pack->nodes_coexist != NULL) {
+    if (!pack->is_exported(input, source->bytes)) return SL_OK;
+    const SlStatus status = append_export_name(fact, strdup(fact->name));
+    if (status == SL_OK) fact->exported = 1;
+    return status;
+  }
   size_t index = export_table_find(exports, fact->name);
   while (index < exports->count && strcmp(exports->items[index].local_name, fact->name) == 0) {
     const SlStatus status = append_export_name(fact, strdup(exports->items[index].export_name));
@@ -717,7 +806,7 @@ static SlStatus collect_declaration_exports(const ExportTable *exports, SlDeclar
   return SL_OK;
 }
 
-static SlStatus initialize_declaration_fact(TSNode input, const ExportTable *exports,
+static SlStatus initialize_declaration_fact(TSNode input, TSNode root, const ExportTable *exports,
                                             const Source *source, const SlLanguagePack *pack,
                                             SlDeclarationKind declaration_kind,
                                             SlDeclarationFact *fact) {
@@ -728,21 +817,21 @@ static SlStatus initialize_declaration_fact(TSNode input, const ExportTable *exp
   const int entrypoint =
       declaration_kind == SL_DECLARATION_FUNCTION && pack->is_entrypoint_name(name);
   *fact = create_declaration_fact(declaration_kind, name, entrypoint, point);
-  const SlStatus export_status = collect_declaration_exports(exports, fact);
+  const SlStatus export_status = collect_declaration_exports(input, exports, source, pack, fact);
   if (export_status != SL_OK) return export_status;
-  const SlStatus calls_status = collect_fact_calls(node, source, pack, fact);
+  const SlStatus calls_status = collect_fact_calls(node, source, pack, root, fact);
   if (calls_status != SL_OK) return calls_status;
   return collect_fact_suppression(input, source, pack, fact);
 }
 
-static SlStatus collect_declaration_fact(TSNode input, const ExportTable *exports,
+static SlStatus collect_declaration_fact(TSNode input, TSNode root, const ExportTable *exports,
                                          const Source *source, const SlLanguagePack *pack,
                                          SlFileFact *file) {
   const SlDeclarationKind declaration_kind = pack->declaration_kind(input, source->bytes);
   if (fact_kind(declaration_kind) == NULL) return SL_OK;
   SlDeclarationFact fact = {0};
   const SlStatus fact_status =
-      initialize_declaration_fact(input, exports, source, pack, declaration_kind, &fact);
+      initialize_declaration_fact(input, root, exports, source, pack, declaration_kind, &fact);
   if (fact_status != SL_OK) return declaration_fact_free(&fact), fact_status;
   const SlStatus status = append_declaration(file, fact);
   if (status != SL_OK) declaration_fact_free(&fact);
@@ -773,6 +862,7 @@ static SlStatus append_file_fact(SlReport *report, SlFileFact file) {
 
 typedef struct {
   const char *path;
+  TSNode root;
   const ExportTable *exports;
   const Source *source;
   const SlLanguagePack *pack;
@@ -784,8 +874,8 @@ static SlStatus collect_file_declaration(TSNode declaration, void *context) {
   SlStatus status = collect_imports(collection->path, declaration, collection->source,
                                     collection->pack, collection->file);
   if (status == SL_OK)
-    status = collect_declaration_fact(declaration, collection->exports, collection->source,
-                                      collection->pack, collection->file);
+    status = collect_declaration_fact(declaration, collection->root, collection->exports,
+                                      collection->source, collection->pack, collection->file);
   return status;
 }
 
@@ -794,7 +884,7 @@ static SlStatus collect_file_fact(const char *path, TSNode root, const ExportTab
                                   SlReport *report) {
   SlFileFact file = {.path = strdup(path), .resolved_path = realpath(path, NULL)};
   if (file.path == NULL || file.resolved_path == NULL) return file_fact_free(&file), SL_IO_ERROR;
-  FileFactCollection collection = {path, exports, source, pack, &file};
+  FileFactCollection collection = {path, root, exports, source, pack, &file};
   const SlStatus collect_status =
       visit_top_level(root, pack, collect_file_declaration, &collection);
   if (collect_status != SL_OK) return file_fact_free(&file), collect_status;
@@ -821,6 +911,7 @@ static void function_free(FunctionFact *function) {
   for (size_t index = 0; index < function->binding_count; index++)
     free(function->bindings[index]);
   free(function->bindings);
+  free(function->binding_nodes);
   *function = (FunctionFact){0};
 }
 
@@ -1621,8 +1712,7 @@ static void call_fact_free(SlCallFact *call) {
 }
 
 static void project_name_index_insert(ProjectNameIndex *index, const SlFileFact *file,
-                                      const SlDeclarationFact *declaration, const char *name,
-                                      int mark_ambiguous) {
+                                      const SlDeclarationFact *declaration, const char *name) {
   size_t slot = hash_path_name(file->resolved_path, name) & (index->capacity - 1);
   while (index->slots[slot].name != NULL &&
          (strcmp(index->slots[slot].name, name) != 0 ||
@@ -1630,26 +1720,24 @@ static void project_name_index_insert(ProjectNameIndex *index, const SlFileFact 
           strcmp(index->slots[slot].file->resolved_path, file->resolved_path) != 0))
     slot = (slot + 1) & (index->capacity - 1);
   if (index->slots[slot].name != NULL) {
-    if (mark_ambiguous) index->slots[slot].ambiguous = 1;
+    index->slots[slot].ambiguous = 1;
     return;
   }
   index->slots[slot] = (ProjectNameSlot){name, file, declaration, 0};
 }
 
 static void project_index_local_file(ProjectNameIndex *index, const SlFileFact *file) {
-  const SlLanguagePack *pack = sl_language_for_path(file->path);
-  const int mark_ambiguous = pack == NULL || pack->nodes_coexist == NULL;
   for (size_t item = 0; item < file->declaration_count; item++) {
     const SlDeclarationFact *declaration = &file->declarations[item];
     if (strcmp(declaration->kind, "function") == 0)
-      project_name_index_insert(index, file, declaration, declaration->name, mark_ambiguous);
+      project_name_index_insert(index, file, declaration, declaration->name);
   }
 }
 
 static void project_index_export_declaration(ProjectNameIndex *index, const SlFileFact *file,
                                              const SlDeclarationFact *declaration) {
   for (size_t name = 0; name < declaration->export_name_count; name++) {
-    project_name_index_insert(index, file, declaration, declaration->export_names[name], 1);
+    project_name_index_insert(index, file, declaration, declaration->export_names[name]);
   }
 }
 
@@ -1724,9 +1812,24 @@ static const ProjectNameSlot *project_index_find(const ProjectNameIndex *index, 
   return NULL;
 }
 
+static int project_local_line_lookup(const ProjectLookup *lookup, const char *name,
+                                     SlResolvedFunction *result) {
+  for (size_t index = 0; index < lookup->file->declaration_count; index++) {
+    const SlDeclarationFact *declaration = &lookup->file->declarations[index];
+    const int matches = strcmp(declaration->kind, "function") == 0 &&
+                        declaration->line == lookup->target_line &&
+                        strcmp(declaration->name, name) == 0;
+    if (!matches) continue;
+    *result = (SlResolvedFunction){.file = lookup->file, .declaration = declaration};
+    return 1;
+  }
+  return 0;
+}
+
 static int project_symbol_lookup(const void *context, const char *path, const char *name,
                                  int exported, SlResolvedFunction *result) {
   const ProjectLookup *lookup = context;
+  if (!exported && lookup->target_line != 0) return project_local_line_lookup(lookup, name, result);
   const ProjectIndex *index = lookup->index;
   const ProjectNameIndex *names = exported ? &index->exports : &index->locals;
   const ProjectNameSlot *slot = project_index_find(names, path, name, lookup->file);
@@ -1736,11 +1839,11 @@ static int project_symbol_lookup(const void *context, const char *path, const ch
 }
 
 static int resolve_called_function(const SlReport *report, const ProjectIndex *index,
-                                   const SlFileFact *file, const char *name,
+                                   const SlFileFact *file, const char *name, size_t target_line,
                                    SlResolvedFunction *result) {
   const SlLanguagePack *pack = sl_language_for_path(file->path);
   if (pack == NULL) return 0;
-  const ProjectLookup lookup = {index, file};
+  const ProjectLookup lookup = {index, file, target_line};
   const SlCallResolutionRequest request = {.project = report,
                                            .caller_file = file,
                                            .called_name = name,
@@ -1772,9 +1875,10 @@ static SlStatus allocate_project_calls(SlReport *report) {
 
 static SlStatus add_resolved_call(SlReport *report, const ProjectIndex *index,
                                   const SlFileFact *caller_file, const SlDeclarationFact *caller,
-                                  const char *name) {
+                                  const char *name, size_t target_line) {
   SlResolvedFunction callee = {0};
-  if (!resolve_called_function(report, index, caller_file, name, &callee)) return SL_OK;
+  if (!resolve_called_function(report, index, caller_file, name, target_line, &callee))
+    return SL_OK;
   SlCallFact call = {.caller_path = strdup(caller_file->path),
                      .caller_name = strdup(caller->name),
                      .callee_path = strdup(callee.file->path),
@@ -1795,8 +1899,10 @@ static SlStatus resolve_declaration_calls(SlReport *report, const ProjectIndex *
                                           const SlDeclarationFact *declaration) {
   if (strcmp(declaration->kind, "function") != 0) return SL_OK;
   for (size_t call = 0; call < declaration->call_count; call++) {
+    const size_t target_line =
+        declaration->call_target_lines == NULL ? 0 : declaration->call_target_lines[call];
     const SlStatus status =
-        add_resolved_call(report, index, file, declaration, declaration->calls[call]);
+        add_resolved_call(report, index, file, declaration, declaration->calls[call], target_line);
     if (status != SL_OK) return status;
   }
   return SL_OK;

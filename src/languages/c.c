@@ -8,10 +8,25 @@ static TSNode declarator_name(TSNode node) {
   return declarator_name(sl_field(node, "declarator"));
 }
 
+static size_t declarator_count(TSNode node) {
+  size_t count = 0;
+  for (uint32_t index = 0; index < ts_node_child_count(node); index++) {
+    const char *field = ts_node_field_name_for_child(node, index);
+    if (field != NULL && strcmp(field, "declarator") == 0) count++;
+  }
+  return count;
+}
+
+static int declaration_declarator(TSNode node) {
+  const TSNode parent = ts_node_parent(node);
+  return sl_node_is(parent, "declaration") && sl_field_is(parent, "declarator", node);
+}
+
 static int top_level_container(TSNode node) {
-  return sl_node_is(node, "preproc_if") || sl_node_is(node, "preproc_ifdef") ||
-         sl_node_is(node, "preproc_elif") || sl_node_is(node, "preproc_elifdef") ||
-         sl_node_is(node, "preproc_else");
+  const int conditional = sl_node_is(node, "preproc_if") || sl_node_is(node, "preproc_ifdef") ||
+                          sl_node_is(node, "preproc_elif") || sl_node_is(node, "preproc_elifdef") ||
+                          sl_node_is(node, "preproc_else");
+  return conditional || (sl_node_is(node, "declaration") && declarator_count(node) > 1);
 }
 
 static int conditional_group(TSNode node) {
@@ -51,6 +66,12 @@ static int is_type_specifier(TSNode node) {
          sl_node_is(node, "enum_specifier");
 }
 
+static int is_function_prototype(TSNode node) {
+  if (sl_node_is(node, "init_declarator")) node = sl_field(node, "declarator");
+  if (!sl_node_is(node, "function_declarator")) return 0;
+  return !sl_node_is(sl_field(node, "declarator"), "parenthesized_declarator");
+}
+
 static SlDeclarationKind declaration_kind(TSNode node, const char *source) {
   (void)source;
   if (sl_node_is(node, "preproc_include")) return SL_DECLARATION_IMPORT;
@@ -58,11 +79,13 @@ static SlDeclarationKind declaration_kind(TSNode node, const char *source) {
   if (sl_node_is(node, "type_definition")) return SL_DECLARATION_TYPE;
   if (sl_node_is(node, "preproc_def") || sl_node_is(node, "preproc_function_def"))
     return SL_DECLARATION_CONSTANT;
+  if (declaration_declarator(node))
+    return is_function_prototype(node) ? SL_DECLARATION_NONE : SL_DECLARATION_CONSTANT;
   if (!sl_node_is(node, "declaration")) return SL_DECLARATION_NONE;
   const TSNode type = sl_field(node, "type");
   const TSNode declarator = sl_field(node, "declarator");
   if (ts_node_is_null(declarator) && is_type_specifier(type)) return SL_DECLARATION_TYPE;
-  if (sl_node_is(declarator, "function_declarator")) return SL_DECLARATION_NONE;
+  if (is_function_prototype(declarator)) return SL_DECLARATION_NONE;
   return SL_DECLARATION_CONSTANT;
 }
 
@@ -70,6 +93,7 @@ static TSNode name_node(TSNode node) {
   if (sl_node_is(node, "preproc_include")) return sl_field(node, "path");
   if (sl_node_is(node, "preproc_def") || sl_node_is(node, "preproc_function_def"))
     return sl_field(node, "name");
+  if (declaration_declarator(node)) return declarator_name(node);
   if (sl_node_is(node, "declaration") && ts_node_is_null(sl_field(node, "declarator")))
     return sl_field(sl_field(node, "type"), "name");
   if (sl_node_is(node, "function_definition") || sl_node_is(node, "type_definition") ||
@@ -89,12 +113,21 @@ static int declarator_wrapper(TSNode node) {
 static TSNode binding_name_node(TSNode node) {
   if (!sl_node_is(node, "identifier")) return (TSNode){0};
   TSNode child = node;
+  int function_declarator = 0;
+  int parenthesized = 0;
   for (TSNode parent = ts_node_parent(child); !ts_node_is_null(parent);
        child = parent, parent = ts_node_parent(parent)) {
+    function_declarator |= sl_node_is(parent, "function_declarator");
+    parenthesized |= sl_node_is(parent, "parenthesized_declarator");
     const int owner = sl_node_is(parent, "declaration") ||
                       sl_node_is(parent, "parameter_declaration") ||
                       sl_node_is(parent, "type_definition");
-    if (owner) return sl_field_is(parent, "declarator", child) ? node : (TSNode){0};
+    if (owner) {
+      const int declarator = sl_field_is(parent, "declarator", child);
+      const int prototype =
+          sl_node_is(parent, "declaration") && function_declarator && !parenthesized;
+      return declarator && !prototype ? node : (TSNode){0};
+    }
     if (!declarator_wrapper(parent)) return (TSNode){0};
   }
   return (TSNode){0};

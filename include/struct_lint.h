@@ -23,6 +23,8 @@ typedef struct {
   size_t column;
   char **calls;
   size_t call_count;
+  /* Optional per-call 1-based local target lines for branch-aware resolution. */
+  size_t *call_target_lines;
   char **suppressions;
   size_t suppression_count;
 } SlDeclarationFact;
