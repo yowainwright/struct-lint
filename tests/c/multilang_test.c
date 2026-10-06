@@ -16,7 +16,7 @@ static const Fixture fixtures[] = {
     {"c/section-order.c", "section-order", 0},
     {"c/parse-error.c", "parse-error", 0},
     {"c/conditional-branches.c", "function-order", 2},
-    {"c/conditional-call-facts.c", NULL, 1},
+    {"c/conditional-call-facts.c", NULL, 2},
     {"c/conditional-shadow.c", "function-order", 1},
     {"c/declarations.h", NULL, 0},
     {"go/clean.go", NULL, 1},
@@ -97,8 +97,14 @@ static int check_conditional_call_fact(void) {
   const SlRequest request = {&path, 1, 1, 1};
   SlReport report = {0};
   const SlStatus status = sl_analyze(&request, &report);
-  const int passed = status == SL_OK && report.count == 0 && report.call_count == 1 &&
-                     report.calls[0].callee_line == 3;
+  int first_target = 0;
+  int second_target = 0;
+  for (size_t index = 0; index < report.call_count; index++) {
+    first_target |= report.calls[index].callee_line == 3;
+    second_target |= report.calls[index].callee_line == 5;
+  }
+  const int passed = status == SL_OK && report.count == 0 && report.call_count == 2 &&
+                     first_target && second_target;
   if (!passed) fprintf(stderr, "incorrect conditional call target: %s\n", path);
   sl_report_free(&report);
   return passed;

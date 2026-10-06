@@ -603,7 +603,10 @@ static void declaration_fact_free(SlDeclarationFact *fact) {
   for (size_t index = 0; index < fact->call_count; index++)
     free(fact->calls[index]);
   free(fact->calls);
-  free(fact->call_target_lines);
+  if (fact->call_targets != NULL)
+    for (size_t index = 0; index < fact->call_count; index++)
+      free(fact->call_targets[index].lines);
+  free(fact->call_targets);
   for (size_t index = 0; index < fact->suppression_count; index++)
     free(fact->suppressions[index]);
   free(fact->suppressions);
@@ -708,8 +711,16 @@ typedef struct {
   const Source *source;
   const SlLanguagePack *pack;
   const FunctionFact *caller;
-  size_t *target_lines;
+  SlCallTargets *targets;
 } CallTargetCollection;
+
+static SlStatus append_call_target(SlCallTargets *targets, size_t line) {
+  size_t *lines = realloc(targets->lines, (targets->count + 1) * sizeof(*lines));
+  if (lines == NULL) return SL_OUT_OF_MEMORY;
+  targets->lines = lines;
+  targets->lines[targets->count++] = line;
+  return SL_OK;
+}
 
 static SlStatus collect_call_target(TSNode node, void *context) {
   CallTargetCollection *collection = context;
@@ -718,17 +729,19 @@ static SlStatus collect_call_target(TSNode node, void *context) {
   for (size_t index = 0; index < collection->caller->call_count; index++) {
     const int same_name =
         node_text_equals(collection->source, name, collection->caller->calls[index]);
-    if (collection->target_lines[index] != 0 || !same_name) continue;
+    if (!same_name) continue;
     if (!nodes_coexist(collection->pack, collection->caller->call_nodes[index], node)) continue;
-    collection->target_lines[index] = ts_node_start_point(node).row + 1;
+    const size_t line = ts_node_start_point(node).row + 1;
+    const SlStatus status = append_call_target(&collection->targets[index], line);
+    if (status != SL_OK) return status;
   }
   return SL_OK;
 }
 
 static SlStatus collect_call_target_lines(TSNode root, const Source *source,
                                           const SlLanguagePack *pack, const FunctionFact *caller,
-                                          size_t *target_lines) {
-  CallTargetCollection collection = {source, pack, caller, target_lines};
+                                          SlCallTargets *targets) {
+  CallTargetCollection collection = {source, pack, caller, targets};
   return visit_top_level(root, pack, collect_call_target, &collection);
 }
 
@@ -740,9 +753,9 @@ static SlStatus collect_fact_calls(TSNode node, const Source *source, const SlLa
   fact->calls = function.calls;
   fact->call_count = function.call_count;
   if (status == SL_OK && pack->nodes_coexist != NULL && function.call_count > 0) {
-    fact->call_target_lines = calloc(function.call_count, sizeof(*fact->call_target_lines));
-    if (fact->call_target_lines == NULL) status = SL_OUT_OF_MEMORY;
-    else status = collect_call_target_lines(root, source, pack, &function, fact->call_target_lines);
+    fact->call_targets = calloc(function.call_count, sizeof(*fact->call_targets));
+    if (fact->call_targets == NULL) status = SL_OUT_OF_MEMORY;
+    else status = collect_call_target_lines(root, source, pack, &function, fact->call_targets);
   }
   free(function.call_nodes);
   for (size_t index = 0; index < function.binding_count; index++)
@@ -1847,8 +1860,14 @@ static int resolve_called_function(const SlReport *report, const ProjectIndex *i
 
 static size_t file_call_capacity(const SlFileFact *file) {
   size_t count = 0;
-  for (size_t item = 0; item < file->declaration_count; item++)
-    count += file->declarations[item].call_count;
+  for (size_t item = 0; item < file->declaration_count; item++) {
+    const SlDeclarationFact *declaration = &file->declarations[item];
+    for (size_t call = 0; call < declaration->call_count; call++) {
+      const size_t targets =
+          declaration->call_targets == NULL ? 0 : declaration->call_targets[call].count;
+      count += targets == 0 ? 1 : targets;
+    }
+  }
   return count;
 }
 
@@ -1887,15 +1906,27 @@ static SlStatus add_resolved_call(SlReport *report, const ProjectIndex *index,
   return SL_OK;
 }
 
+static SlStatus resolve_call_targets(SlReport *report, const ProjectIndex *index,
+                                     const SlFileFact *file, const SlDeclarationFact *declaration,
+                                     size_t call) {
+  const SlCallTargets *targets =
+      declaration->call_targets == NULL ? NULL : &declaration->call_targets[call];
+  if (targets == NULL || targets->count == 0)
+    return add_resolved_call(report, index, file, declaration, declaration->calls[call], 0);
+  for (size_t target = 0; target < targets->count; target++) {
+    const SlStatus status = add_resolved_call(report, index, file, declaration,
+                                              declaration->calls[call], targets->lines[target]);
+    if (status != SL_OK) return status;
+  }
+  return SL_OK;
+}
+
 static SlStatus resolve_declaration_calls(SlReport *report, const ProjectIndex *index,
                                           const SlFileFact *file,
                                           const SlDeclarationFact *declaration) {
   if (strcmp(declaration->kind, "function") != 0) return SL_OK;
   for (size_t call = 0; call < declaration->call_count; call++) {
-    const size_t target_line =
-        declaration->call_target_lines == NULL ? 0 : declaration->call_target_lines[call];
-    const SlStatus status =
-        add_resolved_call(report, index, file, declaration, declaration->calls[call], target_line);
+    const SlStatus status = resolve_call_targets(report, index, file, declaration, call);
     if (status != SL_OK) return status;
   }
   return SL_OK;

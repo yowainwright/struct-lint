@@ -13,6 +13,11 @@ typedef struct {
 } SlDiagnostic;
 
 typedef struct {
+  size_t *lines;
+  size_t count;
+} SlCallTargets;
+
+typedef struct {
   const char *kind;
   char *name;
   int exported;
@@ -23,8 +28,8 @@ typedef struct {
   size_t column;
   char **calls;
   size_t call_count;
-  /* Optional per-call 1-based local target lines for branch-aware resolution. */
-  size_t *call_target_lines;
+  /* Optional per-call 1-based local targets for branch-aware resolution. */
+  SlCallTargets *call_targets;
   char **suppressions;
   size_t suppression_count;
 } SlDeclarationFact;
