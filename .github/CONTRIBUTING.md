@@ -36,7 +36,9 @@ unmanaged hooks and symlinks, and stops if `core.hooksPath` is configured.
 Full builds and tests run through `./scripts/check.sh`, bootstrap, and CI.
 They do not run during commits.
 
-The release version is defined in `CMakeLists.txt`.
+Tagged releases take their version from the `vX.Y.Z` tag. The release
+workflow passes it to `scripts/check.sh` as `SL_VERSION`; local builds use
+CMake's `git describe` version.
 
 Tagged releases publish `struct-lint-{darwin,linux}-{arm64,amd64}.tar.gz`
 archives and `SHA256SUMS`. Each archive includes the executable, `LICENSE`,
