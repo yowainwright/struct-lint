@@ -16,6 +16,8 @@ static const Fixture fixtures[] = {
     {"c/section-order.c", "section-order", 0},
     {"c/parse-error.c", "parse-error", 0},
     {"c/conditional-branches.c", "function-order", 2},
+    {"c/conditional-call-facts.c", NULL, 1},
+    {"c/conditional-shadow.c", "function-order", 1},
     {"c/declarations.h", NULL, 0},
     {"go/clean.go", NULL, 1},
     {"go/function-order.go", "function-order", 1},
@@ -90,6 +92,18 @@ static int check_fixture(const Fixture *fixture) {
   return passed;
 }
 
+static int check_conditional_call_fact(void) {
+  const char *const path = "c/conditional-call-facts.c";
+  const SlRequest request = {&path, 1, 1, 1};
+  SlReport report = {0};
+  const SlStatus status = sl_analyze(&request, &report);
+  const int passed = status == SL_OK && report.count == 0 && report.call_count == 1 &&
+                     report.calls[0].callee_line == 3;
+  if (!passed) fprintf(stderr, "incorrect conditional call target: %s\n", path);
+  sl_report_free(&report);
+  return passed;
+}
+
 static int check_mixed_scan(size_t diagnostics, size_t calls) {
   const char *const paths[] = {"c", "go", "python", "bash", "go/clean.go", "python"};
   const SlRequest request = {paths, sizeof(paths) / sizeof(*paths), 1, 1};
@@ -111,5 +125,6 @@ int main(void) {
     diagnostics += fixtures[index].rule != NULL;
     calls += fixtures[index].calls;
   }
+  if (!check_conditional_call_fact()) return 1;
   return check_mixed_scan(diagnostics, calls) ? 0 : 1;
 }

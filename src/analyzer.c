@@ -513,7 +513,8 @@ static int scope_contains(TSNode scope, TSNode node) {
   return 0;
 }
 
-static int binding_visible_at_call(TSNode binding, TSNode call) {
+static int binding_visible_at_call(const SlLanguagePack *pack, TSNode binding, TSNode call) {
+  if (!nodes_coexist(pack, binding, call)) return 0;
   if (ts_node_start_byte(binding) >= ts_node_start_byte(call)) return 0;
   const TSNode binding_scope = lexical_scope(binding);
   const TSNode call_scope = lexical_scope(call);
@@ -521,13 +522,13 @@ static int binding_visible_at_call(TSNode binding, TSNode call) {
          scope_contains(binding_scope, call_scope);
 }
 
-static int function_has_binding(const FunctionFact *function, const Source *source, TSNode name,
-                                TSNode call) {
+static int function_has_binding(const FunctionFact *function, const Source *source,
+                                const SlLanguagePack *pack, TSNode name, TSNode call) {
   for (size_t index = 0; index < function->binding_count; index++) {
     if (!node_text_equals(source, name, function->bindings[index])) continue;
     const TSNode binding =
         function->binding_nodes == NULL ? (TSNode){0} : function->binding_nodes[index];
-    if (ts_node_is_null(binding) || binding_visible_at_call(binding, call)) return 1;
+    if (ts_node_is_null(binding) || binding_visible_at_call(pack, binding, call)) return 1;
   }
   return 0;
 }
@@ -554,8 +555,8 @@ static SlStatus collect_calls(TSNode node, const Source *source, const SlLanguag
                               FunctionFact *function, int is_root) {
   if (!is_root && pack->is_function_node(node)) return SL_OK;
   const TSNode called_name = pack->called_name_node(node);
-  const int is_shadowed =
-      !ts_node_is_null(called_name) && function_has_binding(function, source, called_name, node);
+  const int is_shadowed = !ts_node_is_null(called_name) &&
+                          function_has_binding(function, source, pack, called_name, node);
   if (!ts_node_is_null(called_name) && !is_shadowed) {
     char *name = pack->call_name == NULL ? node_text(source, called_name)
                                          : pack->call_name(node, source->bytes);
@@ -717,12 +718,8 @@ static SlStatus collect_call_target(TSNode node, void *context) {
   for (size_t index = 0; index < collection->caller->call_count; index++) {
     const int same_name =
         node_text_equals(collection->source, name, collection->caller->calls[index]);
-    if (collection->target_lines[index] == SIZE_MAX || !same_name) continue;
+    if (collection->target_lines[index] != 0 || !same_name) continue;
     if (!nodes_coexist(collection->pack, collection->caller->call_nodes[index], node)) continue;
-    if (collection->target_lines[index] != 0) {
-      collection->target_lines[index] = SIZE_MAX;
-      continue;
-    }
     collection->target_lines[index] = ts_node_start_point(node).row + 1;
   }
   return SL_OK;
@@ -732,11 +729,7 @@ static SlStatus collect_call_target_lines(TSNode root, const Source *source,
                                           const SlLanguagePack *pack, const FunctionFact *caller,
                                           size_t *target_lines) {
   CallTargetCollection collection = {source, pack, caller, target_lines};
-  const SlStatus status = visit_top_level(root, pack, collect_call_target, &collection);
-  if (status != SL_OK) return status;
-  for (size_t index = 0; index < caller->call_count; index++)
-    if (target_lines[index] == SIZE_MAX) target_lines[index] = 0;
-  return SL_OK;
+  return visit_top_level(root, pack, collect_call_target, &collection);
 }
 
 static SlStatus collect_fact_calls(TSNode node, const Source *source, const SlLanguagePack *pack,
