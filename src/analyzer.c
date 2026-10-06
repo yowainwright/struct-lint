@@ -23,8 +23,10 @@ typedef struct {
   char *name;
   TSNode node;
   char **calls;
+  TSNode *call_nodes;
   size_t call_count;
   char **bindings;
+  TSNode *binding_nodes;
   size_t binding_count;
   int exported;
   int entrypoint;
@@ -67,6 +69,7 @@ typedef struct {
 typedef struct {
   const ProjectIndex *index;
   const SlFileFact *file;
+  size_t target_line;
 } ProjectLookup;
 
 typedef struct {
@@ -85,13 +88,19 @@ typedef struct {
   size_t end;
 } TextRange;
 
+typedef SlStatus (*TopLevelVisitor)(TSNode node, void *context);
+
+static int nodes_coexist(const SlLanguagePack *pack, TSNode left, TSNode right);
+
 typedef struct {
   size_t function;
   size_t next_call;
+  size_t next_target;
 } ComponentFrame;
 
 typedef struct {
   FunctionList *functions;
+  const SlLanguagePack *pack;
   const NameIndex *names;
   size_t *indices;
   size_t *lowlinks;
@@ -146,6 +155,20 @@ static const char *section_name(SlDeclarationKind section) {
   if (section == SL_DECLARATION_CONSTANT) return "constants";
   if (section == SL_DECLARATION_FUNCTION) return "functions";
   return "declarations";
+}
+
+static SlStatus visit_top_level(TSNode parent, const SlLanguagePack *pack, TopLevelVisitor visitor,
+                                void *context) {
+  TSTreeCursor cursor = ts_tree_cursor_new(parent);
+  int started = 0;
+  TSNode node;
+  SlStatus status = SL_OK;
+  while (status == SL_OK && !ts_node_is_null(node = sl_next_named_child(&cursor, &started))) {
+    const int container = pack->top_level_container != NULL && pack->top_level_container(node);
+    status = container ? visit_top_level(node, pack, visitor, context) : visitor(node, context);
+  }
+  ts_tree_cursor_delete(&cursor);
+  return status;
 }
 
 static SlStatus append_diagnostic(SlReport *report, SlDiagnostic diagnostic) {
@@ -271,19 +294,26 @@ static SlStatus collect_direct_export(TSNode input, const Source *source,
   return append_export_alias(table, local_name, export_name);
 }
 
+typedef struct {
+  const Source *source;
+  const SlLanguagePack *pack;
+  ExportTable *table;
+} ExportCollection;
+
+static SlStatus collect_direct_export_node(TSNode node, void *context) {
+  ExportCollection *collection = context;
+  if (!collection->pack->is_exported(node, collection->source->bytes)) return SL_OK;
+  SlStatus status =
+      collect_export_aliases(node, collection->source, collection->pack, collection->table);
+  if (status == SL_OK)
+    status = collect_direct_export(node, collection->source, collection->pack, collection->table);
+  return status;
+}
+
 static SlStatus collect_direct_exports(TSNode root, const Source *source,
                                        const SlLanguagePack *pack, ExportTable *table) {
-  TSTreeCursor cursor = ts_tree_cursor_new(root);
-  int started = 0;
-  TSNode declaration;
-  while (!ts_node_is_null(declaration = sl_next_named_child(&cursor, &started))) {
-    if (!pack->is_exported(declaration, source->bytes)) continue;
-    SlStatus status = collect_export_aliases(declaration, source, pack, table);
-    if (status == SL_OK) status = collect_direct_export(declaration, source, pack, table);
-    if (status != SL_OK) return ts_tree_cursor_delete(&cursor), status;
-  }
-  ts_tree_cursor_delete(&cursor);
-  return SL_OK;
+  ExportCollection collection = {source, pack, table};
+  return visit_top_level(root, pack, collect_direct_export_node, &collection);
 }
 
 static int compare_export_aliases(const void *left_value, const void *right_value) {
@@ -432,29 +462,73 @@ static SlStatus collect_fact_suppression(TSNode input, const Source *source,
   return SL_OK;
 }
 
-static SlStatus append_call(FunctionFact *function, char *name) {
+static SlStatus append_call(FunctionFact *function, char *name, TSNode node) {
   if (name == NULL) return SL_OUT_OF_MEMORY;
   const size_t size = (function->call_count + 1) * sizeof(*function->calls);
   char **calls = realloc(function->calls, size);
   if (calls == NULL) return free(name), SL_OUT_OF_MEMORY;
   function->calls = calls;
-  function->calls[function->call_count++] = name;
+  if (ts_node_is_null(node)) {
+    function->calls[function->call_count++] = name;
+    return SL_OK;
+  }
+  TSNode *nodes = realloc(function->call_nodes, (function->call_count + 1) * sizeof(*nodes));
+  if (nodes == NULL) return free(name), SL_OUT_OF_MEMORY;
+  function->call_nodes = nodes;
+  function->calls[function->call_count] = name;
+  function->call_nodes[function->call_count++] = node;
   return SL_OK;
 }
 
-static SlStatus append_binding(FunctionFact *function, char *name) {
+static SlStatus append_binding(FunctionFact *function, char *name, TSNode node) {
   if (name == NULL) return SL_OUT_OF_MEMORY;
   const size_t size = (function->binding_count + 1) * sizeof(*function->bindings);
   char **bindings = realloc(function->bindings, size);
   if (bindings == NULL) return free(name), SL_OUT_OF_MEMORY;
   function->bindings = bindings;
-  function->bindings[function->binding_count++] = name;
+  function->bindings[function->binding_count] = name;
+  if (ts_node_is_null(node)) {
+    function->binding_count++;
+    return SL_OK;
+  }
+  TSNode *nodes = realloc(function->binding_nodes, (function->binding_count + 1) * sizeof(*nodes));
+  if (nodes == NULL) return free(name), SL_OUT_OF_MEMORY;
+  function->binding_nodes = nodes;
+  function->binding_nodes[function->binding_count++] = node;
   return SL_OK;
 }
 
-static int function_has_binding(const FunctionFact *function, const Source *source, TSNode name) {
+static TSNode lexical_scope(TSNode node) {
+  for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+       parent = ts_node_parent(parent))
+    if (node_is(parent, "compound_statement") || node_is(parent, "for_statement") ||
+        node_is(parent, "function_definition"))
+      return parent;
+  return (TSNode){0};
+}
+
+static int scope_contains(TSNode scope, TSNode node) {
+  for (TSNode parent = node; !ts_node_is_null(parent); parent = ts_node_parent(parent))
+    if (ts_node_eq(parent, scope)) return 1;
+  return 0;
+}
+
+static int binding_visible_at_call(const SlLanguagePack *pack, TSNode binding, TSNode call) {
+  if (!nodes_coexist(pack, binding, call)) return 0;
+  if (ts_node_start_byte(binding) >= ts_node_start_byte(call)) return 0;
+  const TSNode binding_scope = lexical_scope(binding);
+  const TSNode call_scope = lexical_scope(call);
+  return !ts_node_is_null(binding_scope) && !ts_node_is_null(call_scope) &&
+         scope_contains(binding_scope, call_scope);
+}
+
+static int function_has_binding(const FunctionFact *function, const Source *source,
+                                const SlLanguagePack *pack, TSNode name, TSNode call) {
   for (size_t index = 0; index < function->binding_count; index++) {
-    if (node_text_equals(source, name, function->bindings[index])) return 1;
+    if (!node_text_equals(source, name, function->bindings[index])) continue;
+    const TSNode binding =
+        function->binding_nodes == NULL ? (TSNode){0} : function->binding_nodes[index];
+    if (ts_node_is_null(binding) || binding_visible_at_call(pack, binding, call)) return 1;
   }
   return 0;
 }
@@ -463,7 +537,8 @@ static SlStatus collect_bindings(TSNode node, const Source *source, const SlLang
                                  FunctionFact *function, int is_root) {
   const TSNode binding = is_root ? (TSNode){0} : pack->binding_name_node(node);
   if (!ts_node_is_null(binding)) {
-    const SlStatus status = append_binding(function, node_text(source, binding));
+    const TSNode context = pack->nodes_coexist == NULL ? (TSNode){0} : binding;
+    const SlStatus status = append_binding(function, node_text(source, binding), context);
     if (status != SL_OK) return status;
   }
   if (!is_root && pack->is_function_node(node)) return SL_OK;
@@ -480,12 +555,13 @@ static SlStatus collect_calls(TSNode node, const Source *source, const SlLanguag
                               FunctionFact *function, int is_root) {
   if (!is_root && pack->is_function_node(node)) return SL_OK;
   const TSNode called_name = pack->called_name_node(node);
-  const int is_shadowed =
-      !ts_node_is_null(called_name) && function_has_binding(function, source, called_name);
+  const int is_shadowed = !ts_node_is_null(called_name) &&
+                          function_has_binding(function, source, pack, called_name, node);
   if (!ts_node_is_null(called_name) && !is_shadowed) {
     char *name = pack->call_name == NULL ? node_text(source, called_name)
                                          : pack->call_name(node, source->bytes);
-    const SlStatus status = append_call(function, name);
+    const TSNode context = pack->nodes_coexist == NULL ? (TSNode){0} : node;
+    const SlStatus status = append_call(function, name, context);
     if (status != SL_OK) return status;
   }
   const uint32_t count = ts_node_named_child_count(node);
@@ -527,6 +603,10 @@ static void declaration_fact_free(SlDeclarationFact *fact) {
   for (size_t index = 0; index < fact->call_count; index++)
     free(fact->calls[index]);
   free(fact->calls);
+  if (fact->call_targets != NULL)
+    for (size_t index = 0; index < fact->call_count; index++)
+      free(fact->call_targets[index].lines);
+  free(fact->call_targets);
   for (size_t index = 0; index < fact->suppression_count; index++)
     free(fact->suppressions[index]);
   free(fact->suppressions);
@@ -627,16 +707,61 @@ static SlStatus collect_imports(const char *path, TSNode declaration, const Sour
   return SL_OK;
 }
 
+typedef struct {
+  const Source *source;
+  const SlLanguagePack *pack;
+  const FunctionFact *caller;
+  SlCallTargets *targets;
+} CallTargetCollection;
+
+static SlStatus append_call_target(SlCallTargets *targets, size_t line) {
+  size_t *lines = realloc(targets->lines, (targets->count + 1) * sizeof(*lines));
+  if (lines == NULL) return SL_OUT_OF_MEMORY;
+  targets->lines = lines;
+  targets->lines[targets->count++] = line;
+  return SL_OK;
+}
+
+static SlStatus collect_call_target(TSNode node, void *context) {
+  CallTargetCollection *collection = context;
+  if (!collection->pack->is_function_node(node)) return SL_OK;
+  const TSNode name = collection->pack->name_node(node);
+  for (size_t index = 0; index < collection->caller->call_count; index++) {
+    const int same_name =
+        node_text_equals(collection->source, name, collection->caller->calls[index]);
+    if (!same_name) continue;
+    if (!nodes_coexist(collection->pack, collection->caller->call_nodes[index], node)) continue;
+    const size_t line = ts_node_start_point(node).row + 1;
+    const SlStatus status = append_call_target(&collection->targets[index], line);
+    if (status != SL_OK) return status;
+  }
+  return SL_OK;
+}
+
+static SlStatus collect_call_target_lines(TSNode root, const Source *source,
+                                          const SlLanguagePack *pack, const FunctionFact *caller,
+                                          SlCallTargets *targets) {
+  CallTargetCollection collection = {source, pack, caller, targets};
+  return visit_top_level(root, pack, collect_call_target, &collection);
+}
+
 static SlStatus collect_fact_calls(TSNode node, const Source *source, const SlLanguagePack *pack,
-                                   SlDeclarationFact *fact) {
+                                   TSNode root, SlDeclarationFact *fact) {
   if (strcmp(fact->kind, "function") != 0) return SL_OK;
   FunctionFact function = {0};
-  const SlStatus status = collect_function_body(node, source, pack, &function);
+  SlStatus status = collect_function_body(node, source, pack, &function);
   fact->calls = function.calls;
   fact->call_count = function.call_count;
+  if (status == SL_OK && pack->nodes_coexist != NULL && function.call_count > 0) {
+    fact->call_targets = calloc(function.call_count, sizeof(*fact->call_targets));
+    if (fact->call_targets == NULL) status = SL_OUT_OF_MEMORY;
+    else status = collect_call_target_lines(root, source, pack, &function, fact->call_targets);
+  }
+  free(function.call_nodes);
   for (size_t index = 0; index < function.binding_count; index++)
     free(function.bindings[index]);
   free(function.bindings);
+  free(function.binding_nodes);
   return status;
 }
 
@@ -668,7 +793,15 @@ static SlDeclarationFact create_declaration_fact(SlDeclarationKind kind, char *n
                              .column = point.column + 1};
 }
 
-static SlStatus collect_declaration_exports(const ExportTable *exports, SlDeclarationFact *fact) {
+static SlStatus collect_declaration_exports(TSNode input, const ExportTable *exports,
+                                            const Source *source, const SlLanguagePack *pack,
+                                            SlDeclarationFact *fact) {
+  if (pack->nodes_coexist != NULL) {
+    if (!pack->is_exported(input, source->bytes)) return SL_OK;
+    const SlStatus status = append_export_name(fact, strdup(fact->name));
+    if (status == SL_OK) fact->exported = 1;
+    return status;
+  }
   size_t index = export_table_find(exports, fact->name);
   while (index < exports->count && strcmp(exports->items[index].local_name, fact->name) == 0) {
     const SlStatus status = append_export_name(fact, strdup(exports->items[index].export_name));
@@ -679,7 +812,7 @@ static SlStatus collect_declaration_exports(const ExportTable *exports, SlDeclar
   return SL_OK;
 }
 
-static SlStatus initialize_declaration_fact(TSNode input, const ExportTable *exports,
+static SlStatus initialize_declaration_fact(TSNode input, TSNode root, const ExportTable *exports,
                                             const Source *source, const SlLanguagePack *pack,
                                             SlDeclarationKind declaration_kind,
                                             SlDeclarationFact *fact) {
@@ -690,21 +823,21 @@ static SlStatus initialize_declaration_fact(TSNode input, const ExportTable *exp
   const int entrypoint =
       declaration_kind == SL_DECLARATION_FUNCTION && pack->is_entrypoint_name(name);
   *fact = create_declaration_fact(declaration_kind, name, entrypoint, point);
-  const SlStatus export_status = collect_declaration_exports(exports, fact);
+  const SlStatus export_status = collect_declaration_exports(input, exports, source, pack, fact);
   if (export_status != SL_OK) return export_status;
-  const SlStatus calls_status = collect_fact_calls(node, source, pack, fact);
+  const SlStatus calls_status = collect_fact_calls(node, source, pack, root, fact);
   if (calls_status != SL_OK) return calls_status;
   return collect_fact_suppression(input, source, pack, fact);
 }
 
-static SlStatus collect_declaration_fact(TSNode input, const ExportTable *exports,
+static SlStatus collect_declaration_fact(TSNode input, TSNode root, const ExportTable *exports,
                                          const Source *source, const SlLanguagePack *pack,
                                          SlFileFact *file) {
   const SlDeclarationKind declaration_kind = pack->declaration_kind(input, source->bytes);
   if (fact_kind(declaration_kind) == NULL) return SL_OK;
   SlDeclarationFact fact = {0};
   const SlStatus fact_status =
-      initialize_declaration_fact(input, exports, source, pack, declaration_kind, &fact);
+      initialize_declaration_fact(input, root, exports, source, pack, declaration_kind, &fact);
   if (fact_status != SL_OK) return declaration_fact_free(&fact), fact_status;
   const SlStatus status = append_declaration(file, fact);
   if (status != SL_OK) declaration_fact_free(&fact);
@@ -733,21 +866,34 @@ static SlStatus append_file_fact(SlReport *report, SlFileFact file) {
   return SL_OK;
 }
 
+typedef struct {
+  const char *path;
+  TSNode root;
+  const ExportTable *exports;
+  const Source *source;
+  const SlLanguagePack *pack;
+  SlFileFact *file;
+} FileFactCollection;
+
+static SlStatus collect_file_declaration(TSNode declaration, void *context) {
+  FileFactCollection *collection = context;
+  SlStatus status = collect_imports(collection->path, declaration, collection->source,
+                                    collection->pack, collection->file);
+  if (status == SL_OK)
+    status = collect_declaration_fact(declaration, collection->root, collection->exports,
+                                      collection->source, collection->pack, collection->file);
+  return status;
+}
+
 static SlStatus collect_file_fact(const char *path, TSNode root, const ExportTable *exports,
                                   const Source *source, const SlLanguagePack *pack,
                                   SlReport *report) {
   SlFileFact file = {.path = strdup(path), .resolved_path = realpath(path, NULL)};
   if (file.path == NULL || file.resolved_path == NULL) return file_fact_free(&file), SL_IO_ERROR;
-  TSTreeCursor cursor = ts_tree_cursor_new(root);
-  int started = 0;
-  TSNode declaration;
-  while (!ts_node_is_null(declaration = sl_next_named_child(&cursor, &started))) {
-    SlStatus status = collect_imports(path, declaration, source, pack, &file);
-    if (status == SL_OK)
-      status = collect_declaration_fact(declaration, exports, source, pack, &file);
-    if (status != SL_OK) return ts_tree_cursor_delete(&cursor), file_fact_free(&file), status;
-  }
-  ts_tree_cursor_delete(&cursor);
+  FileFactCollection collection = {path, root, exports, source, pack, &file};
+  const SlStatus collect_status =
+      visit_top_level(root, pack, collect_file_declaration, &collection);
+  if (collect_status != SL_OK) return file_fact_free(&file), collect_status;
   const SlStatus status = append_file_fact(report, file);
   if (status != SL_OK) file_fact_free(&file);
   return status;
@@ -767,9 +913,11 @@ static void function_free(FunctionFact *function) {
   for (size_t index = 0; index < function->call_count; index++)
     free(function->calls[index]);
   free(function->calls);
+  free(function->call_nodes);
   for (size_t index = 0; index < function->binding_count; index++)
     free(function->bindings[index]);
   free(function->bindings);
+  free(function->binding_nodes);
   *function = (FunctionFact){0};
 }
 
@@ -788,7 +936,8 @@ static SlStatus collect_function(TSNode input, const ExportTable *exports, const
   const TSNode node = pack->declaration_node(input);
   char *name = declaration_name(input, node, source, pack);
   if (name == NULL) return SL_OUT_OF_MEMORY;
-  const int exported = export_table_contains(exports, name);
+  const int exported = pack->nodes_coexist == NULL ? export_table_contains(exports, name)
+                                                   : pack->is_exported(input, source->bytes);
   const int entrypoint = pack->is_entrypoint_name(name);
   const int suppressed = declaration_suppresses(source, input, pack, "function-order");
   FunctionFact function = create_function_fact(name, node, exported, entrypoint, suppressed);
@@ -799,17 +948,23 @@ static SlStatus collect_function(TSNode input, const ExportTable *exports, const
   return status;
 }
 
+typedef struct {
+  const ExportTable *exports;
+  const Source *source;
+  const SlLanguagePack *pack;
+  FunctionList *functions;
+} FunctionCollection;
+
+static SlStatus collect_function_node(TSNode node, void *context) {
+  FunctionCollection *collection = context;
+  return collect_function(node, collection->exports, collection->source, collection->pack,
+                          collection->functions);
+}
+
 static SlStatus collect_functions(TSNode root, const ExportTable *exports, const Source *source,
                                   const SlLanguagePack *pack, FunctionList *functions) {
-  TSTreeCursor cursor = ts_tree_cursor_new(root);
-  int started = 0;
-  TSNode declaration;
-  while (!ts_node_is_null(declaration = sl_next_named_child(&cursor, &started))) {
-    const SlStatus status = collect_function(declaration, exports, source, pack, functions);
-    if (status != SL_OK) return ts_tree_cursor_delete(&cursor), status;
-  }
-  ts_tree_cursor_delete(&cursor);
-  return SL_OK;
+  FunctionCollection collection = {exports, source, pack, functions};
+  return visit_top_level(root, pack, collect_function_node, &collection);
 }
 
 static void function_list_free(FunctionList *functions) {
@@ -852,9 +1007,8 @@ static SlStatus name_index_build(FunctionList *functions, NameIndex *index) {
   index->capacity = index_capacity(functions->count);
   index->slots = calloc(index->capacity, sizeof(*index->slots));
   if (index->slots == NULL) return SL_OUT_OF_MEMORY;
-  for (size_t item = 0; item < functions->count; item++) {
+  for (size_t item = 0; item < functions->count; item++)
     name_index_insert(index, &functions->items[item]);
-  }
   return SL_OK;
 }
 
@@ -865,6 +1019,20 @@ static FunctionFact *name_index_find(const NameIndex *index, const char *name) {
     slot = (slot + 1) & (index->capacity - 1);
   }
   return NULL;
+}
+
+static int name_index_next(const NameIndex *index, const char *name, size_t *slot,
+                           FunctionFact **function) {
+  if (*slot == SIZE_MAX) *slot = hash_name(name) & (index->capacity - 1);
+  while (index->slots[*slot].name != NULL) {
+    const size_t current = *slot;
+    *slot = (current + 1) & (index->capacity - 1);
+    if (strcmp(index->slots[current].name, name) != 0) continue;
+    *function = index->slots[current].function;
+    return 1;
+  }
+  *function = NULL;
+  return 0;
 }
 
 static void component_search_free(ComponentSearch *search) {
@@ -889,8 +1057,8 @@ static int component_search_alloc(ComponentSearch *search, size_t count) {
 }
 
 static SlStatus component_search_init(ComponentSearch *search, FunctionList *functions,
-                                      const NameIndex *names) {
-  *search = (ComponentSearch){.functions = functions, .names = names};
+                                      const SlLanguagePack *pack, const NameIndex *names) {
+  *search = (ComponentSearch){.functions = functions, .pack = pack, .names = names};
   if (functions->count == 0) return SL_OK;
   if (!component_search_alloc(search, functions->count)) {
     return component_search_free(search), SL_OUT_OF_MEMORY;
@@ -904,6 +1072,13 @@ static SlStatus component_search_init(ComponentSearch *search, FunctionList *fun
 
 static size_t function_index(const ComponentSearch *search, const FunctionFact *function) {
   return (size_t)(function - search->functions->items);
+}
+
+static int call_target_matches(const ComponentSearch *search, const FunctionFact *caller,
+                               size_t call, const FunctionFact *target) {
+  const int same_name = strcmp(caller->calls[call], target->name) == 0;
+  if (!same_name || search->pack->nodes_coexist == NULL) return same_name;
+  return search->pack->nodes_coexist(caller->call_nodes[call], target->node);
 }
 
 static void lower_lowlink(ComponentSearch *search, size_t current, size_t candidate) {
@@ -925,19 +1100,45 @@ static void component_enter(ComponentSearch *search, size_t current) {
   search->lowlinks[current] = search->next_index++;
   search->stack[search->stack_count++] = current;
   search->on_stack[current] = 1;
-  search->frames[search->frame_count++] = (ComponentFrame){.function = current};
+  search->frames[search->frame_count++] =
+      (ComponentFrame){.function = current, .next_target = SIZE_MAX};
 }
 
-static int component_advance(ComponentSearch *search, ComponentFrame *frame) {
-  FunctionFact *function = &search->functions->items[frame->function];
-  if (frame->next_call == function->call_count) return 0;
-  const char *call = function->calls[frame->next_call++];
-  FunctionFact *target = name_index_find(search->names, call);
-  if (target == NULL) return 1;
+static int component_visit_target(ComponentSearch *search, ComponentFrame *frame,
+                                  FunctionFact *target) {
   const size_t next = function_index(search, target);
   if (search->indices[next] == SIZE_MAX) return component_enter(search, next), 1;
   if (search->on_stack[next]) lower_lowlink(search, frame->function, search->indices[next]);
   return 1;
+}
+
+static int component_advance_linear(ComponentSearch *search, ComponentFrame *frame,
+                                    FunctionFact *function) {
+  if (frame->next_call == function->call_count) return 0;
+  FunctionFact *target = name_index_find(search->names, function->calls[frame->next_call++]);
+  return target == NULL || component_visit_target(search, frame, target);
+}
+
+static int component_advance_conditional(ComponentSearch *search, ComponentFrame *frame,
+                                         FunctionFact *function) {
+  while (frame->next_call < function->call_count) {
+    FunctionFact *target = NULL;
+    const char *const call = function->calls[frame->next_call];
+    if (!name_index_next(search->names, call, &frame->next_target, &target)) {
+      frame->next_target = SIZE_MAX;
+      frame->next_call++;
+      continue;
+    }
+    if (!call_target_matches(search, function, frame->next_call, target)) continue;
+    return component_visit_target(search, frame, target);
+  }
+  return 0;
+}
+
+static int component_advance(ComponentSearch *search, ComponentFrame *frame) {
+  FunctionFact *function = &search->functions->items[frame->function];
+  if (search->pack->nodes_coexist == NULL) return component_advance_linear(search, frame, function);
+  return component_advance_conditional(search, frame, function);
 }
 
 static void component_finish_frame(ComponentSearch *search) {
@@ -958,9 +1159,9 @@ static void component_visit(ComponentSearch *search, size_t current) {
   }
 }
 
-static SlStatus assign_components(FunctionList *functions, const NameIndex *names,
-                                  ComponentSearch *search) {
-  const SlStatus status = component_search_init(search, functions, names);
+static SlStatus assign_components(FunctionList *functions, const SlLanguagePack *pack,
+                                  const NameIndex *names, ComponentSearch *search) {
+  const SlStatus status = component_search_init(search, functions, pack, names);
   if (status != SL_OK) return status;
   for (size_t index = 0; index < functions->count; index++) {
     if (search->indices[index] == SIZE_MAX) component_visit(search, index);
@@ -983,19 +1184,54 @@ static SlStatus add_function_diagnostic(const char *path, const FunctionFact *ta
   return SL_OUT_OF_MEMORY;
 }
 
-static SlStatus analyze_function_calls(const char *path, FunctionFact *caller,
-                                       const ComponentSearch *search, SlReport *report) {
+static SlStatus analyze_call_target(const char *path, FunctionFact *caller, size_t call,
+                                    FunctionFact *target, const ComponentSearch *search,
+                                    SlReport *report, int *reported) {
+  const int earlier = ts_node_start_byte(target->node) < ts_node_start_byte(caller->node);
+  if (!earlier || !call_target_matches(search, caller, call, target)) return SL_OK;
+  if (target->suppress_function_order) return SL_OK;
+  const size_t current = function_index(search, caller);
+  const size_t target_index = function_index(search, target);
+  if (search->components[current] == search->components[target_index]) return SL_OK;
+  const SlStatus status = add_function_diagnostic(path, target, caller, report);
+  if (status == SL_OK) *reported = 1;
+  return status;
+}
+
+static SlStatus analyze_linear_function_calls(const char *path, FunctionFact *caller,
+                                              const ComponentSearch *search, SlReport *report) {
   for (size_t call = 0; call < caller->call_count; call++) {
     FunctionFact *target = name_index_find(search->names, caller->calls[call]);
-    if (target == NULL || ts_node_start_byte(target->node) >= ts_node_start_byte(caller->node))
-      continue;
-    if (target->suppress_function_order) continue;
-    const size_t caller_index = function_index(search, caller);
-    const size_t target_index = function_index(search, target);
-    if (search->components[caller_index] == search->components[target_index]) continue;
-    return add_function_diagnostic(path, target, caller, report);
+    if (target == NULL) continue;
+    int reported = 0;
+    const SlStatus status =
+        analyze_call_target(path, caller, call, target, search, report, &reported);
+    if (status != SL_OK || reported) return status;
   }
   return SL_OK;
+}
+
+static SlStatus analyze_conditional_function_calls(const char *path, FunctionFact *caller,
+                                                   const ComponentSearch *search,
+                                                   SlReport *report) {
+  for (size_t call = 0; call < caller->call_count; call++) {
+    size_t target_slot = SIZE_MAX;
+    FunctionFact *target = NULL;
+    while (name_index_next(search->names, caller->calls[call], &target_slot, &target)) {
+      int reported = 0;
+      const SlStatus status =
+          analyze_call_target(path, caller, call, target, search, report, &reported);
+      if (status != SL_OK || reported) return status;
+    }
+  }
+  return SL_OK;
+}
+
+static SlStatus analyze_function_calls(const char *path, FunctionFact *caller,
+                                       const ComponentSearch *search, SlReport *report) {
+  if (search->pack->nodes_coexist == NULL)
+    return analyze_linear_function_calls(path, caller, search, report);
+  return analyze_conditional_function_calls(path, caller, search, report);
 }
 
 static SlStatus add_export_diagnostic(const char *path, const FunctionFact *internal,
@@ -1015,8 +1251,36 @@ static SlStatus add_export_diagnostic(const char *path, const FunctionFact *inte
   return SL_OUT_OF_MEMORY;
 }
 
-static SlStatus analyze_export_order(const char *path, const FunctionList *functions,
-                                     const ComponentSearch *search, SlReport *report) {
+static const FunctionFact *next_compatible_export(const FunctionList *functions,
+                                                  const SlLanguagePack *pack, size_t index) {
+  for (size_t next = index + 1; next < functions->count; next++) {
+    const FunctionFact *candidate = &functions->items[next];
+    const int exported = candidate->exported || candidate->entrypoint;
+    if (exported && !candidate->suppress_function_order &&
+        nodes_coexist(pack, functions->items[index].node, candidate->node))
+      return candidate;
+  }
+  return NULL;
+}
+
+static SlStatus analyze_export_order_conditional(const char *path, const FunctionList *functions,
+                                                 const ComponentSearch *search, SlReport *report) {
+  for (size_t index = 0; index < functions->count; index++) {
+    const FunctionFact *function = &functions->items[index];
+    if (function->suppress_function_order) continue;
+    if (function->exported || function->entrypoint) continue;
+    const FunctionFact *next_export = next_compatible_export(functions, search->pack, index);
+    if (next_export == NULL) continue;
+    const size_t current = search->components[function_index(search, function)];
+    const size_t exported = search->components[function_index(search, next_export)];
+    if (current == exported) continue;
+    return add_export_diagnostic(path, function, next_export, report);
+  }
+  return SL_OK;
+}
+
+static SlStatus analyze_export_order_linear(const char *path, const FunctionList *functions,
+                                            const ComponentSearch *search, SlReport *report) {
   const FunctionFact *next_export = NULL;
   for (size_t index = functions->count; index-- > 0;) {
     const FunctionFact *function = &functions->items[index];
@@ -1032,6 +1296,13 @@ static SlStatus analyze_export_order(const char *path, const FunctionList *funct
     return add_export_diagnostic(path, function, next_export, report);
   }
   return SL_OK;
+}
+
+static SlStatus analyze_export_order(const char *path, const FunctionList *functions,
+                                     const ComponentSearch *search, SlReport *report) {
+  if (search->pack->nodes_coexist == NULL)
+    return analyze_export_order_linear(path, functions, search, report);
+  return analyze_export_order_conditional(path, functions, search, report);
 }
 
 static SlStatus diagnose_function_order(const char *path, FunctionList *functions,
@@ -1052,13 +1323,13 @@ static SlStatus analyze_function_order(const char *path, TSNode root, const Expo
   const SlStatus collect_status = collect_functions(root, exports, source, pack, &functions);
   if (collect_status != SL_OK) return function_list_free(&functions), collect_status;
   if (functions.count < 2) return function_list_free(&functions), SL_OK;
-  NameIndex index = {0};
-  SlStatus status = name_index_build(&functions, &index);
+  NameIndex names = {0};
+  SlStatus status = name_index_build(&functions, &names);
   ComponentSearch search = {0};
-  if (status == SL_OK) status = assign_components(&functions, &index, &search);
+  if (status == SL_OK) status = assign_components(&functions, pack, &names, &search);
   if (status == SL_OK) status = diagnose_function_order(path, &functions, &search, report);
   component_search_free(&search);
-  free(index.slots);
+  free(names.slots);
   function_list_free(&functions);
   return status;
 }
@@ -1079,28 +1350,73 @@ static SlStatus add_order_diagnostic(const char *path, TSNode node, SlDeclaratio
   return SL_OUT_OF_MEMORY;
 }
 
+typedef struct {
+  TSNode node;
+  SlDeclarationKind section;
+} SectionFact;
+
+typedef struct {
+  const char *path;
+  const Source *source;
+  const SlLanguagePack *pack;
+  SlReport *report;
+  SectionFact *sections;
+  size_t section_count;
+  size_t function_count;
+  SlDeclarationKind highest;
+} RootAnalysis;
+
+static int nodes_coexist(const SlLanguagePack *pack, TSNode left, TSNode right) {
+  return pack->nodes_coexist == NULL || pack->nodes_coexist(left, right);
+}
+
+static SlDeclarationKind highest_compatible_section(const RootAnalysis *analysis, TSNode node) {
+  SlDeclarationKind highest = SL_DECLARATION_NONE;
+  for (size_t index = 0; index < analysis->section_count; index++) {
+    const SectionFact *previous = &analysis->sections[index];
+    if (previous->section > highest && nodes_coexist(analysis->pack, node, previous->node))
+      highest = previous->section;
+  }
+  return highest;
+}
+
+static SlStatus append_section(RootAnalysis *analysis, TSNode node, SlDeclarationKind section) {
+  const size_t count = analysis->section_count + 1;
+  SectionFact *items = realloc(analysis->sections, count * sizeof(*items));
+  if (items == NULL) return SL_OUT_OF_MEMORY;
+  analysis->sections = items;
+  analysis->sections[analysis->section_count++] = (SectionFact){node, section};
+  return SL_OK;
+}
+
+static SlStatus analyze_root_declaration(TSNode node, void *context) {
+  RootAnalysis *analysis = context;
+  const SlDeclarationKind section = analysis->pack->declaration_kind(node, analysis->source->bytes);
+  if (section == SL_DECLARATION_FUNCTION) analysis->function_count++;
+  if (section == SL_DECLARATION_NONE) return SL_OK;
+  const SlDeclarationKind highest = analysis->pack->nodes_coexist == NULL
+                                        ? analysis->highest
+                                        : highest_compatible_section(analysis, node);
+  const int out_of_order = section < highest;
+  const int suppressed = out_of_order && declaration_suppresses(analysis->source, node,
+                                                                analysis->pack, "section-order");
+  if (out_of_order && !suppressed) {
+    const SlStatus status =
+        add_order_diagnostic(analysis->path, node, section, highest, analysis->report);
+    if (status != SL_OK) return status;
+  }
+  const SlStatus status = append_section(analysis, node, section);
+  if (section > analysis->highest) analysis->highest = section;
+  return status;
+}
+
 static SlStatus analyze_root(const char *path, TSNode root, const ExportTable *exports,
                              const Source *source, const SlLanguagePack *pack, SlReport *report) {
-  SlDeclarationKind highest = SL_DECLARATION_NONE;
-  size_t function_count = 0;
-  TSTreeCursor cursor = ts_tree_cursor_new(root);
-  int started = 0;
-  TSNode node;
-  while (!ts_node_is_null(node = sl_next_named_child(&cursor, &started))) {
-    const SlDeclarationKind section = pack->declaration_kind(node, source->bytes);
-    if (section == SL_DECLARATION_FUNCTION) function_count++;
-    if (section == SL_DECLARATION_NONE) continue;
-    const int out_of_order = section < highest;
-    const int suppressed =
-        out_of_order && declaration_suppresses(source, node, pack, "section-order");
-    if (out_of_order && !suppressed) {
-      const SlStatus status = add_order_diagnostic(path, node, section, highest, report);
-      if (status != SL_OK) return ts_tree_cursor_delete(&cursor), status;
-    }
-    if (section > highest) highest = section;
-  }
-  ts_tree_cursor_delete(&cursor);
-  if (function_count < 2) return SL_OK;
+  RootAnalysis analysis = {path, source, pack, report, NULL, 0, 0, SL_DECLARATION_NONE};
+  const SlStatus status = visit_top_level(root, pack, analyze_root_declaration, &analysis);
+  free(analysis.sections);
+  if (status != SL_OK) return status;
+  if (analysis.function_count < 2) return SL_OK;
   return analyze_function_order(path, root, exports, source, pack, report);
 }
 
@@ -1502,9 +1818,24 @@ static const ProjectNameSlot *project_index_find(const ProjectNameIndex *index, 
   return NULL;
 }
 
+static int project_local_line_lookup(const ProjectLookup *lookup, const char *name,
+                                     SlResolvedFunction *result) {
+  for (size_t index = 0; index < lookup->file->declaration_count; index++) {
+    const SlDeclarationFact *declaration = &lookup->file->declarations[index];
+    const int matches = strcmp(declaration->kind, "function") == 0 &&
+                        declaration->line == lookup->target_line &&
+                        strcmp(declaration->name, name) == 0;
+    if (!matches) continue;
+    *result = (SlResolvedFunction){.file = lookup->file, .declaration = declaration};
+    return 1;
+  }
+  return 0;
+}
+
 static int project_symbol_lookup(const void *context, const char *path, const char *name,
                                  int exported, SlResolvedFunction *result) {
   const ProjectLookup *lookup = context;
+  if (!exported && lookup->target_line != 0) return project_local_line_lookup(lookup, name, result);
   const ProjectIndex *index = lookup->index;
   const ProjectNameIndex *names = exported ? &index->exports : &index->locals;
   const ProjectNameSlot *slot = project_index_find(names, path, name, lookup->file);
@@ -1514,11 +1845,11 @@ static int project_symbol_lookup(const void *context, const char *path, const ch
 }
 
 static int resolve_called_function(const SlReport *report, const ProjectIndex *index,
-                                   const SlFileFact *file, const char *name,
+                                   const SlFileFact *file, const char *name, size_t target_line,
                                    SlResolvedFunction *result) {
   const SlLanguagePack *pack = sl_language_for_path(file->path);
   if (pack == NULL) return 0;
-  const ProjectLookup lookup = {index, file};
+  const ProjectLookup lookup = {index, file, target_line};
   const SlCallResolutionRequest request = {.project = report,
                                            .caller_file = file,
                                            .called_name = name,
@@ -1529,8 +1860,14 @@ static int resolve_called_function(const SlReport *report, const ProjectIndex *i
 
 static size_t file_call_capacity(const SlFileFact *file) {
   size_t count = 0;
-  for (size_t item = 0; item < file->declaration_count; item++)
-    count += file->declarations[item].call_count;
+  for (size_t item = 0; item < file->declaration_count; item++) {
+    const SlDeclarationFact *declaration = &file->declarations[item];
+    for (size_t call = 0; call < declaration->call_count; call++) {
+      const size_t targets =
+          declaration->call_targets == NULL ? 0 : declaration->call_targets[call].count;
+      count += targets == 0 ? 1 : targets;
+    }
+  }
   return count;
 }
 
@@ -1550,9 +1887,10 @@ static SlStatus allocate_project_calls(SlReport *report) {
 
 static SlStatus add_resolved_call(SlReport *report, const ProjectIndex *index,
                                   const SlFileFact *caller_file, const SlDeclarationFact *caller,
-                                  const char *name) {
+                                  const char *name, size_t target_line) {
   SlResolvedFunction callee = {0};
-  if (!resolve_called_function(report, index, caller_file, name, &callee)) return SL_OK;
+  if (!resolve_called_function(report, index, caller_file, name, target_line, &callee))
+    return SL_OK;
   SlCallFact call = {.caller_path = strdup(caller_file->path),
                      .caller_name = strdup(caller->name),
                      .callee_path = strdup(callee.file->path),
@@ -1568,13 +1906,27 @@ static SlStatus add_resolved_call(SlReport *report, const ProjectIndex *index,
   return SL_OK;
 }
 
+static SlStatus resolve_call_targets(SlReport *report, const ProjectIndex *index,
+                                     const SlFileFact *file, const SlDeclarationFact *declaration,
+                                     size_t call) {
+  const SlCallTargets *targets =
+      declaration->call_targets == NULL ? NULL : &declaration->call_targets[call];
+  if (targets == NULL || targets->count == 0)
+    return add_resolved_call(report, index, file, declaration, declaration->calls[call], 0);
+  for (size_t target = 0; target < targets->count; target++) {
+    const SlStatus status = add_resolved_call(report, index, file, declaration,
+                                              declaration->calls[call], targets->lines[target]);
+    if (status != SL_OK) return status;
+  }
+  return SL_OK;
+}
+
 static SlStatus resolve_declaration_calls(SlReport *report, const ProjectIndex *index,
                                           const SlFileFact *file,
                                           const SlDeclarationFact *declaration) {
   if (strcmp(declaration->kind, "function") != 0) return SL_OK;
   for (size_t call = 0; call < declaration->call_count; call++) {
-    const SlStatus status =
-        add_resolved_call(report, index, file, declaration, declaration->calls[call]);
+    const SlStatus status = resolve_call_targets(report, index, file, declaration, call);
     if (status != SL_OK) return status;
   }
   return SL_OK;

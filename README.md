@@ -9,6 +9,7 @@ Written in C, using Tree-sitter to parse source files.
 | --- | --- |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
 | TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` |
+| C | `.c`, `.h` |
 | Vue, Svelte, Astro | `.vue`, `.svelte`, `.astro` scripts |
 | MDX | `.mdx` imports and exports |
 | Go | `.go` |
@@ -99,11 +100,12 @@ analysis failures. Parse errors fail under either profile.
 | `function-order` | Entry points and public functions precede private helpers; callers precede callees. Recursive cycles stay together. |
 | `parse-error` | Source can be parsed using its language's grammar. |
 
-Checks cover top-level declarations and direct calls between named functions.
-Go methods, class internals, and dynamic calls are outside this scope.
-Entry points are `main`, plus `init` in Go. Go public functions start with an
-uppercase letter; Python public functions have no leading underscore. Bash
-`source` and `.` commands count as imports.
+The analyzer checks top-level declarations and direct calls between named
+functions. It does not check Go methods, class internals, C++ files, or dynamic
+calls. Entry points are `main`, plus `init` in Go. Go functions with uppercase
+names and Python functions without a leading underscore count as public. In C,
+functions with external linkage count as public. Bash `source` and `.` commands
+count as imports.
 
 To suppress an ordering rule, put
 `// struct-lint-disable-next <rule-id> -- <reason>` immediately above the
@@ -136,8 +138,11 @@ CommonJS exports can reference named functions or assign functions directly to
 `module.exports` or `exports.name`. Explicit paths and directory index files
 work; package manifests, dynamic paths, and reassigned exports are not resolved.
 CommonJS extension lookup follows Node's `.js`, `.json`, `.node` order; use an
-explicit extension for `.cjs` and TypeScript files. Go, Python, and Bash resolve
-calls within each file.
+explicit extension for `.cjs` and TypeScript files. C, Go, Python, and Bash
+resolve calls within each file. C preprocessor branches (`#if`, `#ifdef`, and
+related directives) are checked independently. struct-lint does not evaluate
+macros or preprocess C files, so it may report findings in branches excluded
+from the current build. Syntax produced by macro expansion is not analyzed.
 
 Vue and Svelte check inline JavaScript and TypeScript scripts. Astro checks
 frontmatter and inline scripts. Each script block has its own ordering checks

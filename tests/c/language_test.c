@@ -6,13 +6,28 @@ static const struct {
   const char *path;
   const char *language;
 } cases[] = {
-    {"main.ts", "typescript"},   {"main.mts", "typescript"},   {"main.cts", "typescript"},
-    {"main.d.ts", "typescript"}, {"main.d.mts", "typescript"}, {"main.d.cts", "typescript"},
-    {"main.tsx", "tsx"},         {"main.js", "javascript"},    {"main.jsx", "javascript"},
-    {"main.cjs", "javascript"},  {"main.mjs", "javascript"},   {"main.go", "go"},
-    {"main.py", "python"},       {"main.pyi", "python"},       {"main.sh", "bash"},
-    {"main.bash", "bash"},       {"view.vue", "vue"},          {"view.svelte", "svelte"},
-    {"view.astro", "astro"},     {"view.mdx", "mdx"},
+    {"main.ts", "typescript"},
+    {"main.mts", "typescript"},
+    {"main.cts", "typescript"},
+    {"main.d.ts", "typescript"},
+    {"main.d.mts", "typescript"},
+    {"main.d.cts", "typescript"},
+    {"main.tsx", "tsx"},
+    {"main.js", "javascript"},
+    {"main.jsx", "javascript"},
+    {"main.cjs", "javascript"},
+    {"main.mjs", "javascript"},
+    {"main.go", "go"},
+    {"main.c", "c"},
+    {"main.h", "c"},
+    {"main.py", "python"},
+    {"main.pyi", "python"},
+    {"main.sh", "bash"},
+    {"main.bash", "bash"},
+    {"view.vue", "vue"},
+    {"view.svelte", "svelte"},
+    {"view.astro", "astro"},
+    {"view.mdx", "mdx"},
 };
 
 static int check_extensions(void) {

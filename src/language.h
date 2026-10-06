@@ -38,6 +38,8 @@ typedef struct {
   size_t extension_count;
   int embedded;
   const TSLanguage *(*tree_sitter_language)(void);
+  int (*top_level_container)(TSNode node);
+  int (*nodes_coexist)(TSNode left, TSNode right);
   TSNode (*declaration_node)(TSNode input);
   SlDeclarationKind (*declaration_kind)(TSNode input, const char *source);
   TSNode (*name_node)(TSNode declaration);
@@ -63,6 +65,7 @@ typedef struct {
 extern const SlLanguagePack sl_typescript_pack;
 extern const SlLanguagePack sl_tsx_pack;
 extern const SlLanguagePack sl_javascript_pack;
+extern const SlLanguagePack sl_c_pack;
 extern const SlLanguagePack sl_go_pack;
 extern const SlLanguagePack sl_python_pack;
 extern const SlLanguagePack sl_bash_pack;
