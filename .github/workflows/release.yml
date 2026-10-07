@@ -18,6 +18,8 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      SL_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:

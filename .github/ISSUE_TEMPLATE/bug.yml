@@ -33,7 +33,7 @@ body:
     id: version
     attributes:
       label: Version or commit
-      placeholder: v0.1.0 or commit SHA
+      placeholder: vX.Y.Z or commit SHA
     validations:
       required: true
 
