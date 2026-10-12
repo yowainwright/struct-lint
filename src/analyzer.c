@@ -1190,6 +1190,10 @@ static SlStatus analyze_call_target(const char *path, FunctionFact *caller, size
   const int earlier = ts_node_start_byte(target->node) < ts_node_start_byte(caller->node);
   if (!earlier || !call_target_matches(search, caller, call, target)) return SL_OK;
   if (target->suppress_function_order) return SL_OK;
+  const int private_caller = !caller->exported && !caller->entrypoint;
+  const int public_target = target->exported || target->entrypoint;
+  const int public_first_applies = private_caller && public_target;
+  if (public_first_applies) return SL_OK;
   const size_t current = function_index(search, caller);
   const size_t target_index = function_index(search, target);
   if (search->components[current] == search->components[target_index]) return SL_OK;
