@@ -32,3 +32,9 @@ status=0
 output="$("$binary" --profile local "$temporary_dir/invalid.js" 2>&1)" || status=$?
 test "$status" -eq 1
 [[ "$output" == *'error[parse-error] could not parse JavaScript source' ]]
+
+for extension in js jsx mjs cjs ts tsx mts cts; do
+  printf '%s\n' 'export function api() { return 1; }' \
+    'function helper() { return api(); }' >"$temporary_dir/public-call.$extension"
+  "$binary" --profile ci "$temporary_dir/public-call.$extension"
+done

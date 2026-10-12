@@ -12,6 +12,22 @@ typedef struct {
 static const char *const extensions[] = {"ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"};
 
 static const SourceCase cases[] = {
+    {"export function api() { return 1; }\nfunction helper() { return api(); }\n", NULL, 1},
+    {"function helper() { return api(); }\nexport function api() { return 1; }\n", "function-order",
+     1},
+    {"export function api() { return shared(); }\nexport function shared() { return 1; }\n", NULL,
+     1},
+    {"export function shared() { return 1; }\nexport function api() { return shared(); }\n",
+     "function-order", 1},
+    {"function caller() { return helper(); }\nfunction helper() { return 1; }\n", NULL, 1},
+    {"function helper() { return 1; }\nfunction caller() { return helper(); }\n", "function-order",
+     1},
+    {"export const api = () => 1;\nconst helper = () => api();\n", NULL, 1},
+    {"function api() { return 1; }\nfunction helper() { return api(); }\nexport { api };\n", NULL,
+     1},
+    {"export function api() { return helper(); }\nexport function shared() { return 1; }\n"
+     "function helper() { return shared(); }\n",
+     NULL, 2},
     {"function main() { return helper(); }\nfunction helper() { return 1; }\n", NULL, 1},
     {"function helper() { return 1; }\nfunction main() { return helper(); }\n", "function-order",
      1},
@@ -79,6 +95,21 @@ static int check_dialects(void) {
   return check_source("invalid.js", &invalid_js) && check_source("invalid.tsx", &invalid_tsx);
 }
 
+static int check_public_calls(void) {
+  const SourceCase c = {"int api(void) { return 1; }\n"
+                        "static int helper(void) { return api(); }\n",
+                        NULL, 1};
+  const SourceCase go = {"package example\nfunc Api() int { return 1 }\n"
+                         "func helper() int { return Api() }\n",
+                         NULL, 1};
+  const SourceCase python = {"def api():\n    return 1\n"
+                             "def _helper():\n    return api()\n",
+                             NULL, 1};
+  const SourceCase bash = {"main() { :; }\nhelper() { main; }\n", NULL, 1};
+  return check_source("public-call.c", &c) && check_source("public-call.go", &go) &&
+         check_source("public-call.py", &python) && check_source("public-call.sh", &bash);
+}
+
 static int check_commonjs(void) {
   const SourceCase commonjs = {"#!/usr/bin/env node\nconst fs = require('fs');\n"
                                "function main() { return helper(); }\n"
@@ -137,6 +168,6 @@ static int check_imports(void) {
 
 int main(void) {
   const int passed = check_variants() && check_dialects() && check_commonjs() &&
-                     check_declarations() && check_imports();
+                     check_declarations() && check_imports() && check_public_calls();
   return passed ? 0 : 1;
 }

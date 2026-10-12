@@ -100,6 +100,9 @@ analysis failures. Parse errors fail under either profile.
 | `function-order` | Entry points and public functions precede private helpers; callers precede callees. Recursive cycles stay together. |
 | `parse-error` | Source can be parsed using its language's grammar. |
 
+When private code calls a public function or entry point, public-first ordering
+takes precedence. Caller-first ordering applies to the remaining calls.
+
 The analyzer checks top-level declarations and direct calls between named
 functions. It does not check Go methods, class internals, C++ files, or dynamic
 calls. Entry points are `main`, plus `init` in Go. Go functions with uppercase
