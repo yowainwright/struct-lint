@@ -3,7 +3,12 @@
     {
       "manager": "github-actions",
       "files": [".github/workflows/*.yml", ".github/workflows/*.yaml"],
-      "mode": "precise"
+      "mode": "precise",
+      "codependencies": [
+        {
+          "yowainwright/homebrew-tap/.github/workflows/publish-formula.yml": "e38d4dd8a962c89cbdddfd624eff8963cd8b1770"
+        }
+      ]
     }
   ]
 }
