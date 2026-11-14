@@ -36,6 +36,15 @@ unmanaged hooks and symlinks, and stops if `core.hooksPath` is configured.
 Full builds and tests run through `./scripts/check.sh`, bootstrap, and CI.
 They do not run during commits.
 
+## Releases
+
+```sh
+mise run release:dry-run
+mise run release:patch
+mise run release:minor
+mise run release:major
+```
+
 Tagged releases take their version from the `vX.Y.Z` tag. The release
 workflow passes it to `scripts/check.sh` as `SL_VERSION`; local builds use
 CMake's `git describe` version.

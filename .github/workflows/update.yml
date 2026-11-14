@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   update:
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
@@ -31,7 +31,9 @@ jobs:
         run: test -n "$GH_TOKEN"
 
       - name: Install Codependence and workflow linter
-        run: brew install yowainwright/tap/codependence actionlint
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install yowainwright/tap/codependence actionlint
+          printf '%s\n' /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
 
       - name: Update GitHub Actions
         env:

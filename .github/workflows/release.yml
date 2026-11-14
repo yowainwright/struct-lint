@@ -73,6 +73,7 @@ jobs:
           name: release-${{ matrix.artifact }}
           path: dist/*.tar.gz
           if-no-files-found: error
+          retention-days: 1
 
   publish:
     needs: build
