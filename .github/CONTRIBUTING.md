@@ -45,16 +45,21 @@ archives and `SHA256SUMS`. Each archive includes the executable, `LICENSE`,
 and `LICENSES/`.
 
 Homebrew registration lives in `yowainwright/homebrew-tap`, under
-`brews/struct-lint.json`. It stays inactive until all four release archives
-are published and the downloaded binary's version matches the tag. Then use
-the tap's `scripts/new-formula struct-lint <version>` (or `update-formula`
-for later releases), following `tmp/struct-lint-release.md` in the tap.
+`brews/struct-lint.json`. The release workflow checks tap access before building.
+After publishing all four archives, it calls the tap's reusable publication
+workflow with the release tag to generate a formula update PR, wait for required
+checks, and verify the merged formula URLs match the inventory version.
+
+Configure the `HOMEBREW_TAP_TOKEN` Actions secret with Contents and Pull requests
+write access to `yowainwright/homebrew-tap`. Missing tap access fails the preflight.
 
 ## Dependency updates
 
 [Codependence](https://github.com/yowainwright/codependence) updates GitHub Actions
 weekly or through a manual run of the `Update GitHub Actions` workflow. Its policy
 lives in [.codependencerc](../.codependencerc); CMake dependency pins remain manual.
+The tap's reusable publication workflow stays pinned because its repository
+does not publish stable action tags. Other GitHub Actions remain eligible for updates.
 
 The workflow installs the CLI with `brew install yowainwright/tap/codependence`,
 validates changed workflows with actionlint, and opens one update PR. It uses the

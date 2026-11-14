@@ -14,7 +14,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  homebrew-preflight:
+    uses: yowainwright/homebrew-tap/.github/workflows/publish-formula.yml@e38d4dd8a962c89cbdddfd624eff8963cd8b1770
+    with:
+      package: struct-lint
+      tag: ${{ github.ref_name }}
+      preflight_only: true
+    secrets:
+      tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
   build:
+    needs: homebrew-preflight
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -89,3 +99,12 @@ jobs:
         run: >-
           gh release create "$GITHUB_REF_NAME" dist/*
           --generate-notes --verify-tag
+
+  homebrew:
+    needs: publish
+    uses: yowainwright/homebrew-tap/.github/workflows/publish-formula.yml@e38d4dd8a962c89cbdddfd624eff8963cd8b1770
+    with:
+      package: struct-lint
+      tag: ${{ github.ref_name }}
+    secrets:
+      tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

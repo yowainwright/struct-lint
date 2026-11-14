@@ -49,9 +49,7 @@ jobs:
           token: ${{ secrets.CODEPENDENCE_TOKEN }}
           branch: update-dependencies/github-actions
           delete-branch: true
-          add-paths: |
-            .github/workflows/*.yml
-            .github/workflows/*.yaml
+          add-paths: .github/workflows/
           commit-message: "chore: update GitHub Actions"
           title: "chore: update GitHub Actions"
           body: |
