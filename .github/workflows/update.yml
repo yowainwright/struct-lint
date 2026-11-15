@@ -16,7 +16,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 5
     env:
       HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
     steps:
