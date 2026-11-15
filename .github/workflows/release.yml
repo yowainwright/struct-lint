@@ -27,7 +27,7 @@ jobs:
     needs: homebrew-preflight
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 5
     env:
       SL_VERSION: ${{ github.ref_name }}
     strategy:
@@ -78,7 +78,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
