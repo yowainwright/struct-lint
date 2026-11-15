@@ -1,3 +1,22 @@
 [tools]
 cmake = "4.4.2"
 shellcheck = "0.11.0"
+
+[tasks."release:dry-run"]
+description = "Validate and preview a patch release without publishing"
+run = "./scripts/release.sh patch --dry-run"
+
+[tasks."release:patch"]
+description = "Validate, confirm, and publish a patch release"
+run = "./scripts/release.sh patch"
+raw = true
+
+[tasks."release:minor"]
+description = "Validate, confirm, and publish a minor release"
+run = "./scripts/release.sh minor"
+raw = true
+
+[tasks."release:major"]
+description = "Validate, confirm, and publish a major release"
+run = "./scripts/release.sh major"
+raw = true
